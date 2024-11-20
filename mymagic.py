@@ -2,6 +2,8 @@
 # itself to be running already.  It only creates the magics subclass but
 # doesn't instantiate it yet.
 from __future__ import print_function
+from pathlib import Path
+import os
 from IPython.core.magic import (Magics, magics_class, line_magic, cell_magic, line_cell_magic)
 import urllib
 from IPython.core.display import display, HTML
@@ -11,6 +13,7 @@ import uuid
 import time
 from datetime import datetime, timedelta, timezone
 from IPython.core.magic_arguments import (argument, magic_arguments, parse_argstring)
+import subprocess
 
 
 
@@ -21,6 +24,12 @@ def add_setting_to_query(query, setting):
     else:
         return query + ' SETTINGS ' + setting
 
+def guard_query_id(query_id):
+    try:
+        uuid.UUID(query_id)
+    except ValueError:
+        raise ValueError(f"'{query_id} is not a valid query id.")
+
 # The class MUST call this class decorator at creation time
 @magics_class
 class JupysqlTextOutputMagics(Magics):
@@ -29,7 +38,26 @@ class JupysqlTextOutputMagics(Magics):
             raise ModuleNotFoundError("Can't find %jupysql magic. Is the extension not loaded?")
 
         return self.shell.run_cell_magic('sql', '', query)
-    
+
+    def run_query_until_result(self, query, timeout_s, wait_message=None):
+        original_feedback_level = self.shell.run_line_magic('config', 'SqlMagic.feedback')
+        self.shell.run_line_magic('config', 'SqlMagic.feedback=0')
+        try:
+            r = self.run_query(query)
+            if len(r) == 0:
+                start_waiting = datetime.now()
+                if wait_message:
+                    print(wait_message + f' (timeout = {timeout_s} seconds)')
+                while len(r) == 0 and (datetime.now() - start_waiting).seconds < timeout_s:
+                    time.sleep(1)
+                    r = self.run_query(query)
+            if len(r) > 0:
+                return r
+            else:
+                raise Exception("Timeout waiting for query to produce results")
+        finally:
+            self.shell.run_line_magic('config', f'SqlMagic.feedback={original_feedback_level}')
+
     def run_and_get_query_id(self, query, silent=False):
         QUERY_LOG_TIMEOUT_SECONDS = 10
 
@@ -37,35 +65,24 @@ class JupysqlTextOutputMagics(Magics):
         tagged_query = add_setting_to_query(query, f"log_comment='{tag}'")
 
         if not silent:
-            print(f'Query log_comment: {tag}')
+            print(f"Query tagged by setting query_log.log_comment to '{tag}'")
+        start_time = datetime.now(timezone.utc)
         self.run_query(tagged_query)
-
-        yesterday = (datetime.now(timezone.utc) + timedelta(days=-1)).strftime("%Y-%m-%d") # allow plenty of margin. maybe some server won't be set to UTC?
-        original_feedback_level = self.shell.run_line_magic('config', 'SqlMagic.feedback')
-        self.shell.run_line_magic('config', 'SqlMagic.feedback=0')
-
+        stop_time = datetime.now(timezone.utc)
+        delta = stop_time - start_time
+        query_duration_ms = 1000*delta.total_seconds() + int(delta.microseconds / 1000)
+        
         # Unfortunately we can't do this in readonly mode
         # self.run_query("SYSTEM FLUSH LOGS")
 
-        find_query_id = f"SELECT query_id, query_duration_ms FROM system.query_log WHERE log_comment='{tag}' AND event_time > '{yesterday}' ORDER BY query_duration_ms DESC LIMIT 1"
-        r = self.run_query(find_query_id)
-        if len(r) == 0:
-            start_waiting = datetime.now()
-            if not silent:
-                print("Waiting for query to appear in system.query_log...")
-            while len(r) == 0 and (datetime.now() - start_waiting).seconds < QUERY_LOG_TIMEOUT_SECONDS:
-                time.sleep(0.5)
-                r = self.run_query(find_query_id)
-        
-        self.shell.run_line_magic('config', f'SqlMagic.feedback={original_feedback_level}')
-        if len(r) == 1:
-            query_id = r[0][0]
-            if not silent:
-                query_duration_ms = r[0][1]
-                print (f'Query {query_id} ran for {query_duration_ms} ms.') 
-            return query_id
-        else:    
-            raise Exception("Timeout waiting for query to appear in system.query_log")
+        yesterday = (start_time + timedelta(days=-1)).strftime("%Y-%m-%d") # allow plenty of margin. maybe some server won't be set to UTC?
+        find_query_id = f"SELECT query_id FROM system.query_log WHERE log_comment='{tag}' AND event_time > '{yesterday}' LIMIT 1 SETTINGS log_comment='jupyter query_id probe'"
+        wait_message = f'Waiting for query with tag {tag} to appear in system.query_log...' if not silent else None
+        r = self.run_query_until_result(query=find_query_id, timeout_s=QUERY_LOG_TIMEOUT_SECONDS, wait_message=wait_message)
+        query_id = r[0][0]
+        if not silent:
+            print (f'Query {query_id} ran for {query_duration_ms} ms.') 
+        return query_id
         
     @line_cell_magic
     @magic_arguments()
@@ -124,7 +141,9 @@ class JupysqlTextOutputMagics(Magics):
             else:
                 query = cell
         else:
-            query_log_query = f"SELECT query FROM system.query_log WHERE query_id='{args.query_id}' LIMIT 1"
+            query_id = args.query_id
+            guard_query_id(query_id)
+            query_log_query = f"SELECT query FROM system.query_log WHERE query_id='{query_id}' LIMIT 1"
             r = self.run_query(query_log_query)
             if len(r) == 1:
                 query = r[0][0]
@@ -156,6 +175,7 @@ class JupysqlTextOutputMagics(Magics):
     )
     @argument('querytext', nargs='*', help='The query to analyse')
     def ch_flame(self, line="", cell=""):
+        TRACE_LOG_TIMEOUT_SECONDS = 10
         args = parse_argstring(self.ch_flame, line)
 
         if args.query_id == '':
@@ -165,18 +185,34 @@ class JupysqlTextOutputMagics(Magics):
                 query = cell
     
             query = cell if line == "" else line
+            query = add_setting_to_query(query, 'query_profiler_cpu_time_period_ns=10000000')
+            query = add_setting_to_query(query, 'query_profiler_real_time_period_ns=10000000')
             query_id = self.run_and_get_query_id(query)
         else:
             query_id = args.query_id
+            guard_query_id(query_id)
 
-        trace_query = f"SELECT arrayStringConcat(arrayReverse(arrayMap(x -> demangle(addressToSymbol(x)), trace)), ';') AS stack, count() AS samples FROM system.trace_log WHERE query_id = '{query_id}' GROUP BY trace SETTINGS allow_introspection_functions=1"
-        r = self.run_query(trace_query)
+        trace_log_query = f"SELECT arrayStringConcat(arrayReverse(arrayMap(x -> demangle(addressToSymbol(x)), trace)), ';') AS stack, count() AS samples FROM system.trace_log WHERE query_id = '{query_id}' GROUP BY trace SETTINGS allow_introspection_functions=1"
+
+        r = self.run_query_until_result(query=trace_log_query, timeout_s=TRACE_LOG_TIMEOUT_SECONDS, wait_message=f'Waiting for trace for query {query_id} to appear in system.trace_log...')
+        if len(r) == 0:
+            raise Exception(f'No trace found for query {query_id}')
         result = '\n'.join([f'{row[0]} {row[1]}' for row in r])
+        print (f'{len(r)} unique samples found.')
 
-        filename = f'{query_id}.flamegraph'
-        with open(filename, 'w') as text_file:
-            text_file.write(result)
-        print(f'Download {filename} and import it in https://www.speedscope.app/')
+        # filename = f'{query_id}.flamegraph'
+        # with open(filename, 'w') as text_file:
+        #     text_file.write(result)
+        # print(f'Download {filename} and import it in https://www.speedscope.app/')
+
+        Path('profiling_data').mkdir(parents=True, exist_ok=True)
+        data_filename = os.path.join('profiling_data', f'{query_id}.flamegraph.data')
+        svg_filename = os.path.join('profiling_data', f'{query_id}.flamegraph.svg')
+        with open(data_filename, 'w') as data_file:
+            data_file.write(result)
+        with open(svg_filename, "w") as svg_file:
+            subprocess.run(["perl", 'flamegraph.pl', data_filename], check=True, stdout=svg_file)
+        display(HTML(svg_filename))
 
 
 # In order to actually use these magics, you must register them with a
