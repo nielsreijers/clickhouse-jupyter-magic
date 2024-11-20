@@ -30,13 +30,14 @@ class JupysqlTextOutputMagics(Magics):
 
         return self.shell.run_cell_magic('sql', '', query)
     
-    def run_and_get_query_id(self, query):
+    def run_and_get_query_id(self, query, silent=False):
         QUERY_LOG_TIMEOUT_SECONDS = 10
 
         tag = f'jupyter tag {uuid.uuid4()}'
         tagged_query = add_setting_to_query(query, f"log_comment='{tag}'")
 
-        print(f'Query log_comment: {tag}')
+        if not silent:
+            print(f'Query log_comment: {tag}')
         self.run_query(tagged_query)
 
         yesterday = (datetime.now(timezone.utc) + timedelta(days=-1)).strftime("%Y-%m-%d") # allow plenty of margin. maybe some server won't be set to UTC?
@@ -46,28 +47,40 @@ class JupysqlTextOutputMagics(Magics):
         # Unfortunately we can't do this in readonly mode
         # self.run_query("SYSTEM FLUSH LOGS")
 
-        find_query_id = f"SELECT query_id FROM system.query_log WHERE log_comment='{tag}' AND event_time > '{yesterday}' ORDER BY event_time_microseconds DESC LIMIT 1"
+        find_query_id = f"SELECT query_id, query_duration_ms FROM system.query_log WHERE log_comment='{tag}' AND event_time > '{yesterday}' ORDER BY query_duration_ms DESC LIMIT 1"
         r = self.run_query(find_query_id)
         if len(r) == 0:
             start_waiting = datetime.now()
-            print("Waiting for query to appear in system.query_log...")
+            if not silent:
+                print("Waiting for query to appear in system.query_log...")
             while len(r) == 0 and (datetime.now() - start_waiting).seconds < QUERY_LOG_TIMEOUT_SECONDS:
                 time.sleep(0.5)
                 r = self.run_query(find_query_id)
         
         self.shell.run_line_magic('config', f'SqlMagic.feedback={original_feedback_level}')
         if len(r) == 1:
-            return r[0][0]
+            query_id = r[0][0]
+            if not silent:
+                query_duration_ms = r[0][1]
+                print (f'Query {query_id} ran for {query_duration_ms} ms.') 
+            return query_id
         else:    
             raise Exception("Timeout waiting for query to appear in system.query_log")
         
     @line_cell_magic
+    @magic_arguments()
+    @argument(
+        "-s", "--silent", action="store_true", help="Don't print query id and duration",
+    )
+    @argument('querytext', nargs='*', help='The query to analyse')
     def qsql(self, line="", cell=""):
-        if 'jupysql' not in self.shell.magics_manager.magics['cell']:
-            raise ModuleNotFoundError("Can't find %jupysql magic. Is the extension not loaded?")
+        args = parse_argstring(self.qsql, line)
 
-        query = cell if line == "" else line
-        return self.run_and_get_query_id(query)
+        if len(args.querytext) > 0:
+            query = " ".join(args.querytext)
+        else:
+            query = cell
+        return self.run_and_get_query_id(query, silent=args.silent)
 
     
     @line_cell_magic
