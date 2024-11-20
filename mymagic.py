@@ -5,6 +5,7 @@ from __future__ import print_function
 from IPython.core.magic import (Magics, magics_class, line_magic, cell_magic, line_cell_magic)
 import urllib
 from IPython.core.display import display, HTML
+from IPython.display import FileLink
 import graphviz
 import uuid
 import time
@@ -29,28 +30,36 @@ class JupysqlTextOutputMagics(Magics):
 
         return self.shell.run_cell_magic('sql', '', query)
     
-    def run_and_get_query_id(self, query):    
+    def run_and_get_query_id(self, query):
+        QUERY_LOG_TIMEOUT_SECONDS = 10
+
         tag = f'jupyter tag {uuid.uuid4()}'
         tagged_query = add_setting_to_query(query, f"log_comment='{tag}'")
+
+        print(f'Query log_comment: {tag}')
         self.run_query(tagged_query)
 
         yesterday = (datetime.now(timezone.utc) + timedelta(days=-1)).strftime("%Y-%m-%d") # allow plenty of margin. maybe some server won't be set to UTC?
         original_feedback_level = self.shell.run_line_magic('config', 'SqlMagic.feedback')
-        self.shell.run_line_magic('config', 'SqlMagic.feedback', 0)
+        self.shell.run_line_magic('config', 'SqlMagic.feedback=0')
 
         # Unfortunately we can't do this in readonly mode
         # self.run_query("SYSTEM FLUSH LOGS")
-        start_waiting = datetime.now()
-        try:
-            while (datetime.now() - start_waiting).seconds < 10:
+
+        find_query_id = f"SELECT query_id FROM system.query_log WHERE log_comment='{tag}' AND event_time > '{yesterday}' ORDER BY event_time_microseconds DESC LIMIT 1"
+        r = self.run_query(find_query_id)
+        if len(r) == 0:
+            start_waiting = datetime.now()
+            print("Waiting for query to appear in system.query_log...")
+            while len(r) == 0 and (datetime.now() - start_waiting).seconds < QUERY_LOG_TIMEOUT_SECONDS:
                 time.sleep(0.5)
-                r = self.run_query(f"SELECT query_id FROM system.query_log WHERE log_comment='{tag}' AND event_time > '{yesterday}' ORDER BY event_time_microseconds DESC LIMIT 1")
-                if r and len(r) == 1:
-                    return r[0][0]
-    
+                r = self.run_query(find_query_id)
+        
+        self.shell.run_line_magic('config', f'SqlMagic.feedback={original_feedback_level}')
+        if len(r) == 1:
+            return r[0][0]
+        else:    
             raise Exception("Timeout waiting for query to appear in system.query_log")
-        finally:
-            self.shell.run_line_magic('config', 'SqlMagic.feedback', original_feedback_level)
         
     @line_cell_magic
     def qsql(self, line="", cell=""):
@@ -88,18 +97,27 @@ class JupysqlTextOutputMagics(Magics):
     @argument(
         "-c", "--compact", action="store_true", help="Add `compact=1` to pass to `EXPLAIN PIPELINE graph=1, compact=1`",
     )
-    @argument('query_parameters', nargs='*', help='Pass file patterns to omit')
+    @argument(
+        '-q', '--query_id', type=str, default='', help='The query_id of a past query to analyse',
+    )
+    @argument('querytext', nargs='*', help='The query to analyse')
     # arser.add_argument('rest', nargs=argparse.REMAINDER, help='The rest of the command line arguments')
-    def ch_plotpipeline(self, line="", cell=""):
-        args = parse_argstring(self.ch_plotpipeline, line)
-
-        if 'jupysql' not in self.shell.magics_manager.magics['cell']:
-            raise ModuleNotFoundError("Can't find %jupysql magic. Is the extension not loaded?")
+    def ch_pipeline(self, line="", cell=""):
+        args = parse_argstring(self.ch_pipeline, line)
         
-        if len(args.query_parameters) > 0:
-            query = " ".join(args.query_parameters)
+        if args.query_id == '':
+            if len(args.querytext) > 0:
+                query = " ".join(args.querytext)
+            else:
+                query = cell
         else:
-            query = cell
+            query_log_query = f"SELECT query FROM system.query_log WHERE query_id='{args.query_id}' LIMIT 1"
+            r = self.run_query(query_log_query)
+            if len(r) == 1:
+                query = r[0][0]
+                print(query)
+            else:
+                raise Exception(f"Query with id '{args.query_id}' not found.")
 
         if args.compact:
             is_compact = 1
@@ -108,7 +126,7 @@ class JupysqlTextOutputMagics(Magics):
         pipeline_query = add_setting_to_query(f"EXPLAIN PIPELINE graph=1, compact={is_compact} { query }",
         "allow_experimental_analyzer = 1")
         
-        r = self.run_query(cell=pipeline_query)
+        r = self.run_query(pipeline_query)
         digraph = "\n\r".join([l[0] for l in r])
 
         if args.create_link:
@@ -116,6 +134,36 @@ class JupysqlTextOutputMagics(Magics):
             display(HTML(f'<h3><a href="{url}">pipeline graph</a></h3>'))
         else:
             display(graphviz.Source(digraph))
+
+
+    @line_cell_magic
+    @magic_arguments()
+    @argument(
+        '-q', '--query_id', type=str, default='', help='The query_id of a past query to analyse',
+    )
+    @argument('querytext', nargs='*', help='The query to analyse')
+    def ch_flame(self, line="", cell=""):
+        args = parse_argstring(self.ch_flame, line)
+
+        if args.query_id == '':
+            if len(args.querytext) > 0:
+                query = " ".join(args.querytext)
+            else:
+                query = cell
+    
+            query = cell if line == "" else line
+            query_id = self.run_and_get_query_id(query)
+        else:
+            query_id = args.query_id
+
+        trace_query = f"SELECT arrayStringConcat(arrayReverse(arrayMap(x -> demangle(addressToSymbol(x)), trace)), ';') AS stack, count() AS samples FROM system.trace_log WHERE query_id = '{query_id}' GROUP BY trace SETTINGS allow_introspection_functions=1"
+        r = self.run_query(trace_query)
+        result = '\n'.join([f'{row[0]} {row[1]}' for row in r])
+
+        filename = f'{query_id}.flamegraph'
+        with open(filename, 'w') as text_file:
+            text_file.write(result)
+        print(f'Download {filename} and import it in https://www.speedscope.app/')
 
 
 # In order to actually use these magics, you must register them with a
