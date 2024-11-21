@@ -35,13 +35,28 @@ def guard_query_id(query_id):
 # The class MUST call this class decorator at creation time
 @magics_class
 class JupysqlTextOutputMagics(Magics):
+
+    
+    
+    ################################################################################
+    #                  Helper methods                                              #
+    ################################################################################
     def run_query(self, query):
+        """
+        Runs a query.
+        Currently this uses jupysql but maybe we should replace this with a direct sqlalchemy query to remove the dependency
+        """
         if 'jupysql' not in self.shell.magics_manager.magics['cell']:
             raise ModuleNotFoundError("Can't find %jupysql magic. Is the extension not loaded?")
 
         return self.shell.run_cell_magic('sql', '', query)
 
     def run_query_until_result(self, query, timeout_s, wait_message=None):
+        """
+        Runs a query repeatedly until it finds a result.
+        This can be used for querying log tables if we don't have SYSTEM FLUSH LOGS permissions,
+        or to repeatedly hit the loadbalancer until it becomes sticky so we (almost) always end up on the same server.
+        """
         original_feedback_level = self.shell.run_line_magic('config', 'SqlMagic.feedback')
         self.shell.run_line_magic('config', 'SqlMagic.feedback=0')
         try:
@@ -61,6 +76,9 @@ class JupysqlTextOutputMagics(Magics):
             self.shell.run_line_magic('config', f'SqlMagic.feedback={original_feedback_level}')
 
     def run_and_get_query_id(self, query, silent=False):
+        """
+        Runs a query and returns the query_id.
+        """
         tag = f'jupyter tag {uuid.uuid4()}'
         tagged_query = add_setting_to_query(query, f"log_comment='{tag}'")
 
@@ -83,7 +101,12 @@ class JupysqlTextOutputMagics(Magics):
         if not silent:
             print (f'Query {query_id} ran for {query_duration_ms} ms.') 
         return query_id
-        
+
+
+    
+    ################################################################################
+    #                  Methods that run a query                                    #
+    ################################################################################
     @line_cell_magic
     @magic_arguments()
     @argument(
@@ -94,6 +117,9 @@ class JupysqlTextOutputMagics(Magics):
     )
     @argument('querytext', nargs='*', help='The query to analyse')
     def qsql(self, line="", cell=""):
+        """
+        Runs a query and returns the query_id.
+        """
         args = parse_argstring(self.qsql, line)
 
         if len(args.querytext) > 0:
@@ -106,9 +132,12 @@ class JupysqlTextOutputMagics(Magics):
 
         return self.run_and_get_query_id(query, silent=args.silent)
 
-    
     @line_cell_magic
     def tsql(self, line="", cell=""):
+        """
+        Runs a query and outputs the result as fixed-width text.
+        Useful for getting readable results from EXPLAIN PLAN or EXPLAIN PIPELINE queries.
+        """
         r = self.run_query(line if line != "" else cell)
 
         if len(r.field_names) == 1:
@@ -125,7 +154,11 @@ class JupysqlTextOutputMagics(Magics):
         else:
             return None
 
+
     
+    ################################################################################
+    #                  Methods to analyse queries                                  #
+    ################################################################################
     @line_cell_magic
     @magic_arguments()
     @argument(
@@ -140,6 +173,9 @@ class JupysqlTextOutputMagics(Magics):
     @argument('querytext', nargs='*', help='The query to analyse')
     # arser.add_argument('rest', nargs=argparse.REMAINDER, help='The rest of the command line arguments')
     def ch_pipeline(self, line="", cell=""):
+        """
+        Show the query pipeline as a graph
+        """
         args = parse_argstring(self.ch_pipeline, line)
         
         if args.query_id == '':
@@ -154,7 +190,6 @@ class JupysqlTextOutputMagics(Magics):
             r = self.run_query(query_log_query)
             if len(r) == 1:
                 query = r[0][0]
-                print(query)
             else:
                 raise Exception(f"Query with id '{args.query_id}' not found.")
 
@@ -174,7 +209,7 @@ class JupysqlTextOutputMagics(Magics):
         else:
             display(graphviz.Source(digraph))
 
-
+    
     @line_cell_magic
     @magic_arguments()
     @argument(
@@ -182,6 +217,9 @@ class JupysqlTextOutputMagics(Magics):
     )
     @argument('querytext', nargs='*', help='The query to analyse')
     def ch_flame(self, line="", cell=""):
+        """
+        Show the trace_log profiling data as a flamegraph
+        """
         args = parse_argstring(self.ch_flame, line)
 
         if args.query_id == '':
