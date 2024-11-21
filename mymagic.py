@@ -96,7 +96,7 @@ class JupysqlTextOutputMagics(Magics):
 
         yesterday = (start_time + timedelta(days=-1)).strftime("%Y-%m-%d") # allow plenty of margin. maybe some server won't be set to UTC?
         find_query_id = f"SELECT query_id FROM system.query_log WHERE log_comment='{tag}' AND event_time > '{yesterday}' LIMIT 1 SETTINGS log_comment='jupyter query_id probe'"
-        wait_message = f'Waiting for query with tag {tag} to appear in system.query_log...' if not silent else None
+        wait_message = f'Trying to find query with tag {tag} in system.query_log...' if not silent else None
         r = self.run_query_until_result(query=find_query_id, timeout_s=POLL_QUERY_LOG_TIMEOUT_SECONDS, wait_message=wait_message)
         query_id = r[0][0]
         if not silent:
@@ -159,7 +159,7 @@ class JupysqlTextOutputMagics(Magics):
     @line_cell_magic
     @magic_arguments()
     @argument(
-        'query', type=str, help=f'The name of the query to run. ({", ".join(commonqueries.keys())})',
+        'query', type=str, help=f'The name of the query to run.', choices=list(commonqueries.keys())
     )
     @argument(
         "-d", "--database", type=str, default='%', help="Optional database filter where applicable."
@@ -219,7 +219,10 @@ class JupysqlTextOutputMagics(Magics):
             query_id = args.query_id
             guard_query_id(query_id)
             query_log_query = f"SELECT query FROM system.query_log WHERE query_id='{query_id}' LIMIT 1"
-            r = self.run_query(query_log_query)
+            r = self.run_query_until_result(
+                query=query_log_query,
+                timeout_s=POLL_QUERY_LOG_TIMEOUT_SECONDS,
+                wait_message=f'Trying to find query {query_id} in system.query_log...')
             if len(r) == 1:
                 query = r[0][0]
             else:
@@ -272,7 +275,7 @@ class JupysqlTextOutputMagics(Magics):
         r = self.run_query_until_result(
             query=trace_log_query,
             timeout_s=POLL_TRACE_LOG_TIMEOUT_SECONDS,
-            wait_message=f'Waiting for trace for query {query_id} to appear in system.trace_log...')
+            wait_message=f'Trying to find trace for query {query_id} in system.trace_log...')
         if len(r) == 0:
             raise Exception(f'No trace found for query {query_id}')
         result = '\n'.join([f'{row[0]} {row[1]}' for row in r])
