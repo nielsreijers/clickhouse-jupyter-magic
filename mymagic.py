@@ -14,6 +14,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from IPython.core.magic_arguments import (argument, magic_arguments, parse_argstring)
 import subprocess
+from mymagic_commonqueries import commonqueries
 
 PROFILER_SETTINGS = 'query_profiler_cpu_time_period_ns=10000000, query_profiler_real_time_period_ns=10000000'
 POLL_QUERY_LOG_TIMEOUT_SECONDS = 10
@@ -155,6 +156,37 @@ class JupysqlTextOutputMagics(Magics):
             return None
 
 
+    @line_cell_magic
+    @magic_arguments()
+    @argument(
+        'query', type=str, help=f'The name of the query to run. ({", ".join(commonqueries.keys())})',
+    )
+    @argument(
+        "-d", "--database", type=str, default='%', help="Optional database filter where applicable."
+    )
+    @argument(
+        "-t", "--table", type=str, default='%', help="Optional table filter where applicable."
+    )
+    @argument(
+        "-c", "--column", type=str, default='%', help="Optional column filter where applicable."
+    )
+    def csql(self, line="", cell=""):
+        """
+        Runs one of a number of predefined common queries.
+        """
+        args = parse_argstring(self.csql, line)
+
+        if args.query not in commonqueries:
+            raise Exception(f"Invalid query name '{args.query}'. Valid query names are: {', '.join(commonqueries.keys())}.")
+        
+        query = commonqueries[args.query].format(
+            database=args.database,
+            table=args.table,
+            column=args.column)
+
+        return self.run_query(query)
+
+    
     
     ################################################################################
     #                  Methods to analyse queries                                  #
