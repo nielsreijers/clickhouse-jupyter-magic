@@ -15,7 +15,9 @@ from datetime import datetime, timedelta, timezone
 from IPython.core.magic_arguments import (argument, magic_arguments, parse_argstring)
 import subprocess
 
-
+PROFILER_SETTINGS = 'query_profiler_cpu_time_period_ns=10000000, query_profiler_real_time_period_ns=10000000'
+POLL_QUERY_LOG_TIMEOUT_SECONDS = 10
+POLL_TRACE_LOG_TIMEOUT_SECONDS = 10
 
 def add_setting_to_query(query, setting):
     # TODO: better parsing. this will fail for queries like "SELECT 'there are no settings here'"
@@ -59,8 +61,6 @@ class JupysqlTextOutputMagics(Magics):
             self.shell.run_line_magic('config', f'SqlMagic.feedback={original_feedback_level}')
 
     def run_and_get_query_id(self, query, silent=False):
-        QUERY_LOG_TIMEOUT_SECONDS = 10
-
         tag = f'jupyter tag {uuid.uuid4()}'
         tagged_query = add_setting_to_query(query, f"log_comment='{tag}'")
 
@@ -78,7 +78,7 @@ class JupysqlTextOutputMagics(Magics):
         yesterday = (start_time + timedelta(days=-1)).strftime("%Y-%m-%d") # allow plenty of margin. maybe some server won't be set to UTC?
         find_query_id = f"SELECT query_id FROM system.query_log WHERE log_comment='{tag}' AND event_time > '{yesterday}' LIMIT 1 SETTINGS log_comment='jupyter query_id probe'"
         wait_message = f'Waiting for query with tag {tag} to appear in system.query_log...' if not silent else None
-        r = self.run_query_until_result(query=find_query_id, timeout_s=QUERY_LOG_TIMEOUT_SECONDS, wait_message=wait_message)
+        r = self.run_query_until_result(query=find_query_id, timeout_s=POLL_QUERY_LOG_TIMEOUT_SECONDS, wait_message=wait_message)
         query_id = r[0][0]
         if not silent:
             print (f'Query {query_id} ran for {query_duration_ms} ms.') 
@@ -89,6 +89,9 @@ class JupysqlTextOutputMagics(Magics):
     @argument(
         "-s", "--silent", action="store_true", help="Don't print query id and duration",
     )
+    @argument(
+        "-p", "--profile", action="store_true", help=f"Add '{PROFILER_SETTINGS}' to query SETTINGS",
+    )
     @argument('querytext', nargs='*', help='The query to analyse')
     def qsql(self, line="", cell=""):
         args = parse_argstring(self.qsql, line)
@@ -97,6 +100,10 @@ class JupysqlTextOutputMagics(Magics):
             query = " ".join(args.querytext)
         else:
             query = cell
+
+        if args.profile:
+           query = add_setting_to_query(query, PROFILER_SETTINGS)
+
         return self.run_and_get_query_id(query, silent=args.silent)
 
     
@@ -175,7 +182,6 @@ class JupysqlTextOutputMagics(Magics):
     )
     @argument('querytext', nargs='*', help='The query to analyse')
     def ch_flame(self, line="", cell=""):
-        TRACE_LOG_TIMEOUT_SECONDS = 10
         args = parse_argstring(self.ch_flame, line)
 
         if args.query_id == '':
@@ -185,8 +191,7 @@ class JupysqlTextOutputMagics(Magics):
                 query = cell
     
             query = cell if line == "" else line
-            query = add_setting_to_query(query, 'query_profiler_cpu_time_period_ns=10000000')
-            query = add_setting_to_query(query, 'query_profiler_real_time_period_ns=10000000')
+            query = add_setting_to_query(query, PROFILER_SETTINGS)
             query_id = self.run_and_get_query_id(query)
         else:
             query_id = args.query_id
@@ -194,7 +199,10 @@ class JupysqlTextOutputMagics(Magics):
 
         trace_log_query = f"SELECT arrayStringConcat(arrayReverse(arrayMap(x -> demangle(addressToSymbol(x)), trace)), ';') AS stack, count() AS samples FROM system.trace_log WHERE query_id = '{query_id}' GROUP BY trace SETTINGS allow_introspection_functions=1"
 
-        r = self.run_query_until_result(query=trace_log_query, timeout_s=TRACE_LOG_TIMEOUT_SECONDS, wait_message=f'Waiting for trace for query {query_id} to appear in system.trace_log...')
+        r = self.run_query_until_result(
+            query=trace_log_query,
+            timeout_s=POLL_TRACE_LOG_TIMEOUT_SECONDS,
+            wait_message=f'Waiting for trace for query {query_id} to appear in system.trace_log...')
         if len(r) == 0:
             raise Exception(f'No trace found for query {query_id}')
         result = '\n'.join([f'{row[0]} {row[1]}' for row in r])
